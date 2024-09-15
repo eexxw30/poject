@@ -1,0 +1,251 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include "Adafruit_BME680.h"
+#include "MQ7.h"
+#include <LiquidCrystal.h>
+#include <WiFi.h>
+#include "AdafruitIO_WiFi.h"
+
+// BME680 Settings
+#define SDA_PIN 22
+#define SCL_PIN 23
+#define SEALEVELPRESSURE_HPA (1013.25)
+
+// MQ7 Settings
+#define A_PIN 34
+#define VOLTAGE 5
+
+// Adafruit IO Settings
+#define IO_USERNAME  "Adafruit_IO user name"
+#define IO_KEY       "Adafruit_IO key"
+#define WIFI_SSID "WIFI name"
+#define WIFI_PASS "WIFI password"
+
+// Create Adafruit IO WiFi client
+AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
+
+// Define Adafruit IO Feeds
+AdafruitIO_Feed *temperature = io.feed("Temperature");
+AdafruitIO_Feed *humidity = io.feed("Humidity");
+AdafruitIO_Feed *pressure = io.feed("Air pressure");
+AdafruitIO_Feed *altitude = io.feed("Altitude");
+AdafruitIO_Feed *co = io.feed("CO");
+AdafruitIO_Feed *gas = io.feed("Gas");
+
+// LCD pin settings
+LiquidCrystal lcd(15, 16, 17, 18, 19, 21);
+
+// Create sensor objects
+Adafruit_BME680 bme;
+MQ7 mq7(A_PIN, VOLTAGE);
+
+// Median filter buffer
+#define BUFFER_SIZE 5
+float tempBuffer[BUFFER_SIZE], humBuffer[BUFFER_SIZE], pressureBuffer[BUFFER_SIZE], coBuffer[BUFFER_SIZE], gasBuffer[BUFFER_SIZE];
+int bufferIndex = 0;
+
+unsigned long lastPageSwitch = 0;
+unsigned long lastDataRefresh = 0;
+unsigned long lastDataCollect = 0;
+bool showPageOne = true; 
+
+// Kalman filter parameters
+float Q = 0.1;
+float R = 0.1;
+float P = 1, K = 0;
+
+float tempEstimate = 0;
+float humEstimate = 0;
+float pressureEstimate = 0;
+float coEstimate = 0;
+float gasEstimate = 0;
+
+// Kalman-filtered variables (global)
+float kalmanTemperature = 0;
+float kalmanHumidity = 0;
+float kalmanPressure = 0;
+float kalmanCO = 0;
+float kalmanGas = 0;
+
+// Kalman filter function
+float kalman(float measurement, float* estimate) {
+  P = P + Q;
+  K = P / (P + R);
+  *estimate = *estimate + K * (measurement - *estimate);
+  P = (1 - K) * P;
+  return *estimate;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Initialize BME680 sensor
+  if (!bme.begin(0x76)) { 
+    Serial.println(F("Could not find a valid BME680 sensor, check wiring!"));
+    while (1);
+  }
+
+  // Initialize BME680 sensor parameters
+  bme.setTemperatureOversampling(BME680_OS_8X);
+  bme.setHumidityOversampling(BME680_OS_2X);
+  bme.setPressureOversampling(BME680_OS_4X);
+  bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+  bme.setGasHeater(320, 150);
+
+  // Calibrate MQ7 sensor
+  Serial.println("Calibrating MQ7");
+  mq7.calibrate();
+  Serial.println("Calibration done!");
+
+  // Initialize LCD
+  lcd.begin(16, 2);
+
+  // Try to connect to WiFi and set timeout
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    io.connect();
+    while(io.status() < AIO_CONNECTED) {
+      Serial.print(".");
+      delay(500);
+    }
+    Serial.println("Adafruit IO Connected!");
+  } else {
+    Serial.println("Failed to connect to WiFi, running offline.");
+  }
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Collect data every 2 seconds
+  if (currentMillis - lastDataCollect >= 2000) {
+    lastDataCollect = currentMillis;
+
+    // Read data from BME680 sensor
+    if (!bme.performReading()) {
+      Serial.println(F("Failed to perform reading from BME680 sensor"));
+      return;
+    }
+
+    // Read CO concentration from MQ7
+    float co_ppm = mq7.readPpm();
+
+    // Store sensor data in buffer
+    tempBuffer[bufferIndex] = bme.temperature;
+    humBuffer[bufferIndex] = bme.humidity;
+    pressureBuffer[bufferIndex] = bme.pressure / 100.0;
+    coBuffer[bufferIndex] = co_ppm;
+    gasBuffer[bufferIndex] = bme.gas_resistance / 1000.0;
+    bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
+
+    // Get median
+    float medianTemperature = median(tempBuffer, BUFFER_SIZE);
+    float medianHumidity = median(humBuffer, BUFFER_SIZE);
+    float medianPressure = median(pressureBuffer, BUFFER_SIZE);
+    float medianCO = median(coBuffer, BUFFER_SIZE);
+    float medianGas = median(gasBuffer, BUFFER_SIZE);
+
+    // Further smooth data using Kalman filter
+    kalmanTemperature = kalman(medianTemperature, &tempEstimate);
+    kalmanHumidity = kalman(medianHumidity, &humEstimate);
+    kalmanPressure = kalman(medianPressure, &pressureEstimate);
+    kalmanCO = kalman(medianCO, &coEstimate);
+    kalmanGas = kalman(medianGas, &gasEstimate);
+
+    // Print Kalman filtered data to serial monitor
+    Serial.println("Kalman Filtered Data:");
+    Serial.print("Temperature: "); Serial.println(kalmanTemperature);
+    Serial.print("Humidity: "); Serial.println(kalmanHumidity);
+    Serial.print("Pressure: "); Serial.println(kalmanPressure);
+    Serial.print("CO: "); Serial.println(kalmanCO);
+    Serial.print("Gas: "); Serial.println(kalmanGas);
+  }
+
+  // Upload data to Adafruit IO every 8 seconds
+  if (currentMillis - lastDataRefresh >= 8000) {
+    lastDataRefresh = currentMillis;
+
+    if (WiFi.status() == WL_CONNECTED) {
+      // Upload data to Adafruit IO
+      temperature->save(kalmanTemperature);
+      humidity->save(kalmanHumidity);
+      pressure->save(kalmanPressure);
+      altitude->save(bme.readAltitude(SEALEVELPRESSURE_HPA));
+      co->save(kalmanCO);
+      gas->save(kalmanGas);
+      Serial.println("Filtered data uploaded to Adafruit IO");
+    } else {
+      Serial.println("WiFi not connected, skipping upload to Adafruit IO");
+    }
+  }
+
+  // Switch pages every 3 seconds
+  if (currentMillis - lastPageSwitch >= 3000) {
+    lastPageSwitch = currentMillis;
+    showPageOne = !showPageOne;
+  }
+
+  // Display data on LCD
+  if (showPageOne) {
+    displayPageOne();
+  } else {
+    displayPageTwo();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    io.run();
+  }
+}
+
+// Median filter function
+float median(float buffer[], int size) {
+  float temp[BUFFER_SIZE];
+  memcpy(temp, buffer, sizeof(float) * size);
+  for (int i = 0; i < size - 1; i++) {
+    for (int j = i + 1; j < size; j++) {
+      if (temp[i] > temp[j]) {
+        float t = temp[i];
+        temp[i] = temp[j];
+        temp[j] = t;
+      }
+    }
+  }
+  return temp[size / 2];
+}
+
+void displayPageOne() {
+  lcd.setCursor(0, 0);
+  lcd.print("T:");
+  lcd.print(tempEstimate, 2);
+  lcd.print(" H:");
+  lcd.print(humEstimate, 1);
+  lcd.print("%  ");
+
+  lcd.setCursor(0, 1);
+  lcd.print("A: ");
+  lcd.print(bme.readAltitude(SEALEVELPRESSURE_HPA), 1);
+  lcd.print(" m    ");
+}
+
+void displayPageTwo() {
+  lcd.setCursor(0, 0);
+  lcd.print("CO:");
+  lcd.print(coEstimate, 2);
+  lcd.print("Gas:");
+  lcd.print(gasEstimate, 1);
+  lcd.print("K");
+
+  lcd.setCursor(0, 1);
+  lcd.print("P: ");
+  lcd.print(pressureEstimate, 1);
+  lcd.print("hPa  ");
+}
